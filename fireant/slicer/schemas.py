@@ -1,5 +1,4 @@
 # coding: utf-8
-from fireant import settings
 from fireant.slicer import transformers
 from fireant.slicer.managers import SlicerManager, TransformerManager
 from pypika import JoinType
@@ -35,7 +34,7 @@ class SlicerElement(object):
     def __repr__(self):
         return self.key
 
-    def schemas(self, *args):
+    def schemas(self, *args, **kwargs):
         return [
             (self.key, self.definition)
         ]
@@ -85,7 +84,7 @@ class ContinuousDimension(Dimension):
         super(ContinuousDimension, self).__init__(key=key, label=label, definition=definition, joins=joins)
         self.default_interval = default_interval
 
-    def schemas(self, *args):
+    def schemas(self, *args, **kwargs):
         size, offset = args if args else (self.default_interval.size, self.default_interval.offset)
         return [(self.key, Mod(self.definition + offset, size))]
 
@@ -116,9 +115,9 @@ class DatetimeDimension(ContinuousDimension):
         super(DatetimeDimension, self).__init__(key=key, label=label, definition=definition, joins=joins,
                                                 default_interval=default_interval)
 
-    def schemas(self, *args):
+    def schemas(self, *args, **kwargs):
         interval = args[0] if args else self.default_interval
-        return [(self.key, settings.database.round_date(self.definition, interval.size))]
+        return [(self.key, kwargs['database'].round_date(self.definition, interval.size))]
 
 
 class CategoricalDimension(Dimension):
@@ -132,9 +131,13 @@ class UniqueDimension(Dimension):
         super(UniqueDimension, self).__init__(key=key, label=label, definition=definition, joins=joins)
         self.display_field = display_field
 
-    def schemas(self, *args):
-        id_field_schemas = [('{key}'.format(key=self.key), self.definition)]
-        return id_field_schemas + [('{key}_display'.format(key=self.key), self.display_field)]
+    def schemas(self, *args, **kwargs):
+        schemas = [('{key}'.format(key=self.key), self.definition)]
+
+        if self.display_field:
+            schemas.append(('{key}_display'.format(key=self.key), self.display_field))
+
+        return schemas
 
     def levels(self):
         if self.display_field is not None:
@@ -166,15 +169,42 @@ class Join(object):
 
 
 class Slicer(object):
-    def __init__(self, table, metrics=tuple(), dimensions=tuple(), joins=tuple()):
+    def __init__(self, table, database, metrics=tuple(), dimensions=tuple(), joins=tuple(), hint_table=None):
+        """
+        Constructor for a slicer.  Contains all the fields to initialize the slicer.
+
+        :param table: (Required)
+            A Pypika Table reference. The primary table that this slicer will retrieve data from.
+
+        :param database:  (Required)
+            A Database reference. Holds the connection details used by this slicer to execute queries.
+
+        :param metrics: (Required: At least one)
+            A list of metrics which can be queried.  Metrics are the types of data that are displayed.
+
+        :param dimensions: (Optional)
+            A list of dimensions used for grouping metrics.  Dimensions are used as the axes in charts, the indices in
+            tables, and also for splitting charts into multiple lines.
+
+        :param joins:  (Optional)
+            A list of join descriptions for joining additional tables.  Joined tables are only used when querying a
+            metric or dimension which requires it.
+
+        :param hint_table: (Optional)
+            A hint table used for querying dimension options.  If not present, the table will be used.  The hint_table
+            must have the same definition as the table omitting dimensions which do not have a set of options (such as
+            datetime dimensions) and the metrics.  This is provided to more efficiently query dimension options.
+        """
         self.table = table
+        self.database = database
 
         self.metrics = {metric.key: metric for metric in metrics}
         self.dimensions = {dimension.key: dimension for dimension in dimensions}
         self.joins = {join.key: join for join in joins}
+        self.hint_table = hint_table
 
         self.manager = SlicerManager(self)
-        for name, bundle in transformers.bundles.items():
+        for name, bundle in transformers.BUNDLES.items():
             setattr(self, name, TransformerManager(self.manager, bundle))
 
 

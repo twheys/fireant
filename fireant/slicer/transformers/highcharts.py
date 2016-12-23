@@ -2,10 +2,12 @@
 import numpy as np
 import pandas as pd
 
+from fireant.slicer.operations import Totals
 from fireant import settings, utils
+
 from .base import Transformer, TransformationException
 
-colors = {
+COLORS = {
     'kayak': ['#FF690F', '#1A1A1A', '#3083F0', '#00B86B', '#D10244', '#FFDBE5', '#7B4F4B', '#B903AA', '#B05B6F'],
     'dark-blue': ["#DDDF0D", "#55BF3B", "#DF5353", "#7798BF", "#AAEEEE", "#FF0066", "#EEAAEE",
                   "#55BF3B", "#DF5353", "#7798BF", "#AAEEEE"],
@@ -35,6 +37,11 @@ def _format_data_point(value):
     return value
 
 
+MISSING_CONT_DIM_MESSAGE = ('Highcharts line charts require a continuous dimension as the first '
+                            'dimension.  Please add a continuous dimension from your Slicer to '
+                            'your request.')
+
+
 class HighchartsLineTransformer(Transformer):
     """
     Transforms data frames into Highcharts format for several chart types, particularly line or bar charts.
@@ -45,17 +52,13 @@ class HighchartsLineTransformer(Transformer):
     def prevalidate_request(self, slicer, metrics, dimensions,
                             metric_filters, dimension_filters,
                             references, operations):
-        super(HighchartsLineTransformer, self).prevalidate_request(slicer, metrics, dimensions,
-                                                                   metric_filters, dimension_filters,
-                                                                   references, operations)
+        if not dimensions or not slicer.dimensions:
+            raise TransformationException(MISSING_CONT_DIM_MESSAGE)
 
         from fireant.slicer import ContinuousDimension
-
         dimension0 = slicer.dimensions[dimensions[0]]
-        if not dimensions or not isinstance(dimension0, ContinuousDimension):
-            raise TransformationException('Highcharts line charts require a continuous dimension as the first '
-                                          'dimension.  Please add a continuous dimension from your Slicer to '
-                                          'your request.')
+        if not isinstance(dimension0, ContinuousDimension):
+            raise TransformationException(MISSING_CONT_DIM_MESSAGE)
 
     def transform(self, dataframe, display_schema):
         has_references = isinstance(dataframe.columns, pd.MultiIndex)
@@ -91,16 +94,16 @@ class HighchartsLineTransformer(Transformer):
         }
 
     def yaxis_options(self, dataframe, dim_ordinal, display_schema):
-        return [{
-            'title': None
-        }] * len(display_schema['metrics'])
+        axes = {metric_schema.get('axis')
+                for metric_schema in display_schema['metrics'].values()}
+        return [{'title': None}] * len(axes)
 
     def _make_series(self, dataframe, dim_ordinal, display_schema, reference=None):
         metrics = list(dataframe.columns.levels[0]
                        if isinstance(dataframe.columns, pd.MultiIndex)
                        else dataframe.columns)
 
-        color = colors.get(settings.highcharts_colors, 'grid')
+        color = COLORS.get(settings.highcharts_colors, 'grid')
         n_colors = len(color)
 
         return [self._make_series_item(idx, item, dim_ordinal, display_schema, metrics, reference, color[i % n_colors])
@@ -112,7 +115,7 @@ class HighchartsLineTransformer(Transformer):
             'name': self._format_label(idx, dim_ordinal, display_schema, reference),
             'data': self._format_data(item),
             'tooltip': self._format_tooltip(display_schema['metrics'][metric_key]),
-            'yAxis': metrics.index(utils.slice_first(idx)),
+            'yAxis': display_schema['metrics'][metric_key].get('axis', 0),
             'color': color,
             'dashStyle': 'Dot' if reference else 'Solid'
         }
@@ -166,9 +169,9 @@ class HighchartsLineTransformer(Transformer):
 
         dimension_labels = [self._format_dimension_display(dim_ordinal, key, dimension, idx)
                             for key, dimension in list(display_schema['dimensions'].items())[1:]]
-        dimension_labels = [dimension_label  # filter out the NaNs
+        dimension_labels = [dimension_label  # filter out the Totals
                             for dimension_label in dimension_labels
-                            if dimension_label is not np.nan]
+                            if dimension_label is not Totals.label]
 
         return (
             '{metric} ({dimensions})'.format(
@@ -216,10 +219,6 @@ class HighchartsColumnTransformer(HighchartsLineTransformer):
     def prevalidate_request(self, slicer, metrics, dimensions,
                             metric_filters, dimension_filters,
                             references, operations):
-        super(HighchartsLineTransformer, self).prevalidate_request(slicer, metrics, dimensions,
-                                                                   metric_filters, dimension_filters,
-                                                                   references, operations)
-
         if dimensions and 2 < len(dimensions):
             # Too many dimensions
             raise TransformationException('Highcharts bar and column charts support at a maximum two dimensions.  '
@@ -231,6 +230,9 @@ class HighchartsColumnTransformer(HighchartsLineTransformer):
                                           'two dimensions.  Please remove some dimensions or metrics.  '
                                           'Request included %d metrics and %d dimensions.' % (len(metrics),
                                                                                               len(dimensions)))
+
+    def yaxis_options(self, dataframe, dim_ordinal, display_schema):
+        return [{'title': None }] * len(display_schema['metrics'])
 
     def _make_series_item(self, idx, item, dim_ordinal, display_schema, metrics, reference, color='#000'):
         metric_key = utils.slice_first(idx)
@@ -278,16 +280,18 @@ class HighchartsColumnTransformer(HighchartsLineTransformer):
             return None
 
         category_dimension = list(display_schema['dimensions'].values())[0]
-        if 'display_options' in category_dimension:
-            return [category_dimension['display_options'].get(dim, dim)
-                    # Pandas gives both NaN or None in the index depending on whether a level was unstacked
-                    if dim and not (isinstance(dim, (float, int)) and np.isnan(dim))
-                    else 'Totals'
-                    for dim in dataframe.index]
 
         if 'display_field' in category_dimension:
             display_field = category_dimension['display_field']
-            return dataframe.index.get_level_values(display_field).unique().tolist()
+            return dataframe.index.get_level_values(display_field).tolist()
+
+        if isinstance(dataframe.index, pd.DatetimeIndex):
+            if any(value.time() for value in dataframe.index):
+                return [value.isoformat() for value in dataframe.index]
+            return [value.strftime("%y-%m-%d") for value in dataframe.index]
+
+        display_options = category_dimension.get('category_dimension', {})
+        return [display_options.get(value, value) for value in dataframe.index]
 
 
 class HighchartsBarTransformer(HighchartsColumnTransformer):

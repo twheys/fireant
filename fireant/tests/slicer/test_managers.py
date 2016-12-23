@@ -1,4 +1,5 @@
 # coding: utf-8
+import copy
 from unittest import TestCase
 
 from mock import patch, MagicMock
@@ -6,14 +7,17 @@ from mock import patch, MagicMock
 from fireant.slicer import *
 from fireant.slicer.managers import SlicerManager
 from fireant.slicer.transformers import *
+from fireant.tests.database.mock_database import TestDatabase
 from pypika import Table
 
 
 class ManagerInitializationTests(TestCase):
     def setUp(self):
-        table = Table('test')
+        self.test_table = Table('test')
+        self.test_database = TestDatabase()
         self.slicer = Slicer(
-            table,
+            self.test_table,
+            self.test_database,
 
             metrics=[
                 Metric('foo'),
@@ -24,7 +28,7 @@ class ManagerInitializationTests(TestCase):
                 ContinuousDimension('cont'),
                 DatetimeDimension('date'),
                 CategoricalDimension('cat'),
-                UniqueDimension('uni', display_field=table.uni_label),
+                UniqueDimension('uni', display_field=self.test_table.uni_label),
             ]
         )
 
@@ -49,9 +53,8 @@ class ManagerInitializationTests(TestCase):
     @patch('fireant.slicer.managers.SlicerManager.post_process')
     @patch('fireant.slicer.managers.SlicerManager.query_data')
     @patch('fireant.slicer.managers.SlicerManager.operation_schema')
-    @patch('fireant.slicer.managers.SlicerManager.query_schema')
-    @patch('fireant.settings.database')
-    def test_data(self, mock_db, mock_query_schema, mock_operation_schema, mock_query_data, mock_post_process):
+    @patch('fireant.slicer.managers.SlicerManager.data_query_schema')
+    def test_data(self, mock_query_schema, mock_operation_schema, mock_query_data, mock_post_process):
         mock_args = {'metrics': [0], 'dimensions': [1],
                      'metric_filters': [2], 'dimension_filters': [3],
                      'references': [4], 'operations': [5]}
@@ -98,15 +101,15 @@ class ManagerInitializationTests(TestCase):
         self.assertEqual(mock_return, result)
         mock_sm_data.assert_called_once_with(**request)
         mock_sm_ds.assert_called_once_with(request['metrics'], request['dimensions'], request.get('references', ()), ())
-        mock_transform.assert_called_once_with(mock_df.__getitem__(), mock_schema)
+        mock_transform.assert_called_once_with(mock_df, mock_schema)
 
     @patch.object(HighchartsLineTransformer, 'transform')
     def test_transform_highcharts_line_chart(self, mock_transform):
         request = {
             'metrics': ['foo', 'bar'],
             'dimensions': ['cont'],
-            'metric_filters': tuple(), 'dimension_filters': tuple(),
-            'references': tuple(), 'operations': tuple(),
+            'metric_filters': (), 'dimension_filters': (),
+            'references': (), 'operations': (),
         }
         self._test_transform(self.slicer.highcharts.line_chart, mock_transform, request)
 
@@ -115,8 +118,8 @@ class ManagerInitializationTests(TestCase):
         request = {
             'metrics': ['foo', 'bar'],
             'dimensions': ['date'],
-            'metric_filters': tuple(), 'dimension_filters': tuple(),
-            'references': tuple(), 'operations': tuple(),
+            'metric_filters': (), 'dimension_filters': (),
+            'references': (), 'operations': (),
         }
         self._test_transform(self.slicer.highcharts.line_chart, mock_transform, request)
 
@@ -130,13 +133,25 @@ class ManagerInitializationTests(TestCase):
         with self.assertRaises(TransformationException):
             self._test_transform(self.slicer.highcharts.line_chart, mock_transform, request)
 
+    @patch.object(HighchartsLineTransformer, 'transform')
+    def test_transform_highcharts_require_cont_dim_on_slicer_with_no_dims(self, mock_transform):
+        request = {
+            'metrics': ['foo', 'bar'],
+            'dimensions': [],
+        }
+
+        slicer = copy.deepcopy(self.slicer)
+        slicer.dimensions = []
+        with self.assertRaises(TransformationException):
+            self._test_transform(self.slicer.highcharts.line_chart, mock_transform, request)
+
     @patch.object(HighchartsColumnTransformer, 'transform')
     def test_transform_highcharts_column_chart(self, mock_transform):
         request = {
             'metrics': ['foo'],
             'dimensions': [],
-            'metric_filters': tuple(), 'dimension_filters': tuple(),
-            'references': tuple(), 'operations': tuple(),
+            'metric_filters': (), 'dimension_filters': (),
+            'references': (), 'operations': (),
         }
         self._test_transform(self.slicer.highcharts.column_chart, mock_transform, request)
 
@@ -164,8 +179,8 @@ class ManagerInitializationTests(TestCase):
     def test_transform_highcharts_bar_chart(self, mock_transform):
         request = {
             'metrics': ['foo'], 'dimensions': [],
-            'metric_filters': tuple(), 'dimension_filters': tuple(),
-            'references': tuple(), 'operations': tuple(),
+            'metric_filters': (), 'dimension_filters': (),
+            'references': (), 'operations': (),
         }
         self._test_transform(self.slicer.highcharts.bar_chart, mock_transform, request)
 
@@ -194,8 +209,8 @@ class ManagerInitializationTests(TestCase):
         request = {
             'metrics': ['foo', 'bar'],
             'dimensions': ['cat', 'uni'],
-            'metric_filters': tuple(), 'dimension_filters': tuple(),
-            'references': tuple(), 'operations': tuple(),
+            'metric_filters': (), 'dimension_filters': (),
+            'references': (), 'operations': (),
         }
 
         self._test_transform(self.slicer.datatables.row_index_table, mock_transform, request)
@@ -205,8 +220,8 @@ class ManagerInitializationTests(TestCase):
         request = {
             'metrics': ['foo', 'bar'],
             'dimensions': ['cat', 'uni'],
-            'metric_filters': tuple(), 'dimension_filters': tuple(),
-            'references': tuple(), 'operations': tuple(),
+            'metric_filters': (), 'dimension_filters': (),
+            'references': (), 'operations': (),
         }
 
         self._test_transform(self.slicer.datatables.column_index_table, mock_transform, request)
@@ -216,8 +231,8 @@ class ManagerInitializationTests(TestCase):
         request = {
             'metrics': ['foo', 'bar'],
             'dimensions': ['cat', 'uni'],
-            'metric_filters': tuple(), 'dimension_filters': tuple(),
-            'references': tuple(), 'operations': tuple(),
+            'metric_filters': (), 'dimension_filters': (),
+            'references': (), 'operations': (),
         }
 
         self._test_transform(self.slicer.datatables.row_index_csv, mock_transform, request)
@@ -227,16 +242,15 @@ class ManagerInitializationTests(TestCase):
         request = {
             'metrics': ['foo', 'bar'],
             'dimensions': ['cat', 'uni'],
-            'metric_filters': tuple(), 'dimension_filters': tuple(),
-            'references': tuple(), 'operations': tuple(),
+            'metric_filters': (), 'dimension_filters': (),
+            'references': (), 'operations': (),
         }
 
         self._test_transform(self.slicer.datatables.column_index_csv, mock_transform, request)
 
     @patch.object(SlicerManager, 'query_data')
-    @patch.object(SlicerManager, 'query_schema')
-    @patch('fireant.settings.database')
-    def test_remove_duplicate_metric_keys(self, mock_database, mock_query_schema, mock_query_data):
+    @patch.object(SlicerManager, 'data_query_schema')
+    def test_remove_duplicate_metric_keys(self, mock_query_schema, mock_query_data):
         self.slicer.manager.data(
             metrics=['foo', 'foo']
         )
@@ -249,9 +263,8 @@ class ManagerInitializationTests(TestCase):
         )
 
     @patch.object(SlicerManager, 'query_data')
-    @patch.object(SlicerManager, 'query_schema')
-    @patch('fireant.settings.database')
-    def test_remove_duplicate_dimension_keys(self, mock_database, mock_query_schema, mock_query_data):
+    @patch.object(SlicerManager, 'data_query_schema')
+    def test_remove_duplicate_dimension_keys(self, mock_query_schema, mock_query_data):
         self.slicer.manager.data(
             metrics=['foo'],
             dimensions=['fizz', 'fizz'],
@@ -265,9 +278,8 @@ class ManagerInitializationTests(TestCase):
         )
 
     @patch.object(SlicerManager, 'query_data')
-    @patch.object(SlicerManager, 'query_schema')
-    @patch('fireant.settings.database')
-    def test_remove_duplicate_dimension_keys_with_interval(self, mock_database, mock_query_schema, mock_query_data):
+    @patch.object(SlicerManager, 'data_query_schema')
+    def test_remove_duplicate_dimension_keys_with_interval(self, mock_query_schema, mock_query_data):
         self.slicer.manager.data(
             metrics=['foo'],
             dimensions=['fizz', ('fizz', DatetimeDimension.week)],
@@ -281,10 +293,8 @@ class ManagerInitializationTests(TestCase):
         )
 
     @patch.object(SlicerManager, 'query_data')
-    @patch.object(SlicerManager, 'query_schema')
-    @patch('fireant.settings.database')
-    def test_remove_duplicate_dimension_keys_with_interval_backwards(self, mock_database, mock_query_schema,
-                                                                     mock_query_data):
+    @patch.object(SlicerManager, 'data_query_schema')
+    def test_remove_duplicate_dimension_keys_with_interval_backwards(self, mock_query_schema, mock_query_data):
         mock_query_schema.reset()
         self.slicer.manager.data(
             metrics=['foo'],

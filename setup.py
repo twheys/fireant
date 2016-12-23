@@ -2,15 +2,11 @@
 
 from setuptools import setup
 
-__major_version__ = 0
-__minor_version__ = 1
-__patch_version__ = 1
+from fireant import __version__
 
 setup(
     name='fireant',
-    version='{major}.{minor}.{patch}'.format(major=__major_version__,
-                                             minor=__minor_version__,
-                                             patch=__patch_version__),
+    version=__version__,
 
     author='KAYAK, GmbH',
     author_email='bandit@kayak.com',
@@ -58,7 +54,7 @@ setup(
     install_requires=[
         'six',
         'pandas==0.18.1',
-        'pypika==0.0.28'
+        'pypika==0.1.8'
     ],
     tests_require=[
         'mock'

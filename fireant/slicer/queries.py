@@ -1,32 +1,26 @@
 # coding: utf-8
+import copy
 import logging
 
+import numpy as np
 import pandas as pd
 
-from fireant import settings
-from pypika import Query, Interval, JoinType
+from fireant.slicer.operations import Totals
+from pypika import Query, JoinType
 
 logger = logging.Logger('fireant')
 
-reference_dimension_mappers = {
-    'yoy': lambda join_key: join_key + Interval(weeks=52),
-    'qoq': lambda join_key: join_key + Interval(quarters=1),
-    'mom': lambda join_key: join_key + Interval(weeks=4),
-    'wow': lambda join_key: join_key + Interval(weeks=1),
-}
-reference_metric_mappers = {
-    'd': lambda field, join_field: (field - join_field),
-    'p': lambda field, join_field: ((field - join_field) / join_field),
-}
-
 
 class QueryManager(object):
-    def query_data(self, table, joins=None,
+    def query_data(self, database, table, joins=None,
                    metrics=None, dimensions=None,
                    mfilters=None, dfilters=None,
                    references=None, rollup=None):
         """
         Loads a pandas data frame given a table and a description of the request.
+
+        :param database:
+            The database interface to use to execute the connection
 
        :param table:
             Type: pypika.Table
@@ -41,15 +35,15 @@ class QueryManager(object):
 
         :param metrics:
             Type: dict[str: pypika.Field]]
-            A dict containing metrics fields to query.  This value is required to contain at least one entry.  The key used
-            will match the corresponding column in the returned pd.DataFrame.
+            A dict containing metrics fields to query.  This value is required to contain at least one entry.  The key
+            used will match the corresponding column in the returned pd.DataFrame.
 
         :param dimensions:
             Type: OrderedDict[str: pypika.Field]]
-            (Optional) An OrderedDict containing indices to query.  If empty, a pd.Series will be returned containing one
-            value per metric.  If given one entry, a pd.DataFrame with a single index will be returned.  If more than one
-            value is given, then a pd.DataFrame with a multi-index will be returned.  The key used will match the
-            corresponding index level in the returned DataFrame.
+            (Optional) An OrderedDict containing indices to query.  If empty, a pd.Series will be returned containing
+            one value per metric.  If given one entry, a pd.DataFrame with a single index will be returned.  If more
+            than one value is given, then a pd.DataFrame with a multi-index will be returned.  The key used will match
+            the corresponding index level in the returned DataFrame.
 
             If a dict is used instead of an OrderedDict, then the index levels cannot be guarenteed, so in most cases an
             OrderedDict should be used.
@@ -88,7 +82,8 @@ class QueryManager(object):
             Valid modifier types are as follows:
 
             - *d*: Delta - difference between previous value and current
-            - *p*: Delta Percentage - difference between previous value and current as a percentage of the previous value.
+            - *p*: Delta Percentage - difference between previous value and current as a percentage of the previous
+                    value.
 
             Examples:
 
@@ -108,26 +103,60 @@ class QueryManager(object):
         :return:
             A pd.DataFrame indexed by the provided dimensions paramaters containing columns for each metrics parameter.
         """
-        query = self._build_query(table, joins or dict(), metrics or dict(), dimensions or dict(),
-                                  dfilters or dict(), mfilters or dict(), references or dict(), rollup or dict())
+        query = self._build_data_query(table, joins or dict(), metrics or dict(), dimensions or dict(),
+                                       dfilters or dict(), mfilters or dict(), references or dict(), rollup or list())
 
         querystring = str(query)
         logger.info("Executing query:\n----START----\n{query}\n-----END-----".format(query=querystring))
 
-        dataframe = settings.database.fetch_dataframe(querystring)
+        dataframe = database.fetch_dataframe(querystring)
+
+        for dimension_key in rollup:
+            dataframe[dimension_key].replace([np.nan], [Totals.key], inplace=True)
+
         dataframe.columns = [col.decode('utf-8') if isinstance(col, bytes) else col
                              for col in dataframe.columns]
-        dataframe = dataframe.set_index(
-            # Removed the reference keys for now
-            list(dimensions.keys())  # + ['{1}_{0}'.format(*ref) for ref in references.items()]
-        ).sort_index()
+
+        if dimensions:
+            dataframe = dataframe.set_index(
+                # Removed the reference keys for now
+                list(dimensions.keys())  # + ['{1}_{0}'.format(*ref) for ref in references.items()]
+            ).sort_index()
 
         if references:
             dataframe.columns = pd.MultiIndex.from_product([[''] + list(references.keys()), list(metrics.keys())])
 
-        return dataframe
+        return dataframe.fillna(0)
 
-    def _build_query(self, table, joins, metrics, dimensions, dfilters, mfilters, references, rollup):
+    def query_dimension_options(self, database, table, joins=None, dimensions=None, filters=None, limit=None):
+        """
+        Builds and executes a query to retrieve possible dimension options given a set of filters.
+
+        :param database:
+            The database interface to use to execute the connection
+        :param table:
+            See above
+
+        :param joins:
+            See above
+
+        :param dimensions:
+            See above
+
+        :param filters:
+            See above
+
+        :param limit:
+            An optional limit to the number of results returned.
+
+        :return:
+        """
+        query = self._build_dimension_query(table, joins, dimensions, filters, limit)
+        results = database.fetch(str(query))
+        return [{k: v for k, v in zip(dimensions.keys(), result)}
+                for result in results]
+
+    def _build_data_query(self, table, joins, metrics, dimensions, dfilters, mfilters, references, rollup):
         args = (table, joins, metrics, dimensions, dfilters, mfilters, rollup)
         query = self._build_query_inner(*args)
 
@@ -140,31 +169,57 @@ class QueryManager(object):
         wrapper_query = Query.from_(query).select(*[query.field(key).as_(key)
                                                     for key in list(dimensions.keys()) + list(metrics.keys())])
 
-        for reference_key, dimension_key in references.items():
-            dimension_f, metric_f = self._get_reference_mappers(reference_key)
+        for reference_key, schema in references.items():
+            dimension_key = schema['dimension']
 
-            dfilters = self._hack_dfilters(dfilters, dimension_key, dimension_f)
-            ref_query = self._build_query_inner(table, joins, metrics, dimensions,
-                                                dfilters, mfilters, rollup)
+            dimensions, dfilters = self._replace_dim_for_ref(dfilters, dimension_key, dimensions, schema['interval'])
+            ref_query = self._build_query_inner(table, joins, metrics, dimensions, dfilters, mfilters, rollup)
 
-            ref_dimension = ref_query.field(dimension_key)
-            ref_criteria = query.field(dimension_key) == dimension_f(ref_dimension)
+            ref_criteria = query.field(dimension_key) == ref_query.field(dimension_key)
             for dkey in set(dimensions.keys()) - {dimension_key}:
                 ref_criteria &= query.field(dkey) == ref_query.field(dkey)
+
+            # Optional modifier function to modify the metric in the reference query. This is for delta and delta
+            # percentage references. It is None for normal references and this default should be used
+            modifier = schema.get('modifier')
+
+            reference_metrics = [
+                modifier(query.field(key), ref_query.field(key)).as_(self._suffix(key, reference_key))
+                for key in metrics.keys()
+                ] if modifier else [
+                ref_query.field(key).as_(self._suffix(key, reference_key))
+                for key in metrics.keys()]
 
             # Join the reference query and select the reference dimension and all metrics
             # This ignores additional dimensions since they are identical to the primary results
             wrapper_query = (
-                wrapper_query.join(ref_query, JoinType.left)
-                    .on(ref_criteria)
+                wrapper_query.join(ref_query, JoinType.left).on(ref_criteria)
                     # Don't select this for now
                     # .select(ref_dimension.as_(self._suffix(dimension_key, reference_key)))
-                    .select(
-                    *[metric_f(query.field(key), ref_query.field(key)).as_(self._suffix(key, reference_key))
-                      for key in metrics.keys()])
+                    .select(*[
+                    # Select the metrics after applying the modifier (such as Delta/Delta Percentage) if there is one
+                    modifier(query.field(key), ref_query.field(key)).as_(self._suffix(key, reference_key))
+                    for key in metrics.keys()
+                    ] if modifier else [
+                    # If no modifier, just select the metric from the subquery
+                    ref_query.field(key).as_(self._suffix(key, reference_key))
+                    for key in metrics.keys()])
             )
 
         return self._add_sorting(wrapper_query, [query.field(dkey) for dkey in dimensions.keys()])
+
+    def _build_dimension_query(self, table, joins, dimensions, filters, limit=None):
+        query = Query.from_(table).distinct()
+        query = self._add_joins(joins, query)
+        query = self._add_filters(query, filters, [])
+
+        for key, dimension in dimensions.items():
+            query = query.select(dimension.as_(key))
+
+        if limit:
+            query = query[:limit]
+
+        return query
 
     def _build_query_inner(self, table, joins, metrics, dimensions, dfilters, mfilters, rollup):
         query = Query.from_(table)
@@ -223,72 +278,30 @@ class QueryManager(object):
         return '%s_%s' % (key, suffix) if suffix else key
 
     @staticmethod
-    def _get_reference_mappers(reference_key):
+    def _replace_dim_for_ref(dfilters, dimension_key, dimensions, interval):
         """
-        Selects the mapper functions for a reference operation.
+        Replaces the dimension used by a reference in the dimension schema and dimension filter schema.
 
-        :param reference_key:
-            A string identifier that maps to the reference operations.  This contains one to two parts separated by an
-            underscore '_' character.  The first part is required and maps to a reference criteria from the dict
-            reference_criterion.  The second part is optional and maps to a reference field from the dict
-            reference_field.
-
-            The reference criteria is the criteria used to link the values from the original query to the comparison
-            values.  For example, in wow (Week over Week), the criteria maps a date field to the same date field minus one
-            week.
-
-            The reference field is an optional part that modifies the selected field in the final results.  For example,
-            in wow_p (Week over Week change as a Percentage), the final field is the query field minus the comparison
-            field as a ratio of the join field.  This gives the change in value over the last week as a percentage of
-            the current value.  If the reference key does not contain two parts (no '_' character), then a function will
-            still be returned for metric_mapper, however it will not modify the final field.
-
-            Concretely, if the field is clicks and current value is 105 and the wow value is 100, then the change is
-            (105 - 100) = 5 clicks, then the wow-p value is (105 - 100) / 100 = 0.05.
-        :return:
-            Type: Tuple
-            (dimension_mapper, metric_mapper)
+        We do this in order to build the same query with a shifted date instead of the actual date.
         """
-        split_ref = reference_key.split('_')
-        if 1 < len(split_ref):
-            reference_key, opt_parts = split_ref[0], split_ref[1]
-        else:
-            reference_key, opt_parts = split_ref[0], None
+        target_dimension = dimensions[dimension_key]
 
-        return (
-            reference_dimension_mappers.get(reference_key, lambda join_key: join_key),
-            reference_metric_mappers.get(opt_parts, lambda field, join_field: join_field)
-        )
+        new_dimensions = copy.deepcopy(dimensions)
+        new_dimensions[dimension_key] = target_dimension + interval
 
-    @staticmethod
-    def _build_reference_join_criterion(query, dimensions, criterion_f, dimension_key):
-        """
-        Returns join criterion for joining a reference query.
-
-        :param query:
-
-        :param dimensions:
-
-        :param criterion_f:
-
-        :param dimension_key:
-
-        :return:
-            join criterion for joining a reference query.
-        """
-        compared_dimension = dimensions[dimension_key]
-        cx = criterion_f(compared_dimension, query.field(dimension_key))
-        for dimension in dimensions.values():
-            if dimension is not compared_dimension:
-                cx &= dimension == dimension.for_(query)
-        return cx
-
-    def _hack_dfilters(self, dfilters, dimension_key, dimension_f):
-        # FIXME Hacky solution for replacing reference filters with shifted values
+        new_dfilters = []
         for dfilter in dfilters:
-            if not getattr(dfilter, 'term') or not dfilter.term.name == dimension_key:
-                continue
+            # This is a very hack way of doing this.  This expects the dfilter to use the exact same reference to
+            # the dimension's definition, which the slicer manager guarentees and the unit tests simulate.
+            # TODO provide a utility in pypika for checking if these are the same
+            try:
+                if dfilter.term.fields()[0] is target_dimension.fields()[0]:
+                    dfilter = copy.deepcopy(dfilter)
+                    dfilter.term = dfilter.term + interval
 
-            dfilter.term = dimension_f(dfilter.term)
+            except (AttributeError, IndexError):
+                pass  # If the above if-expression cannot be evaluated, then its not the filter we are looking for
 
-        return dfilters
+            new_dfilters.append(dfilter)
+
+        return new_dimensions, new_dfilters

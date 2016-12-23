@@ -13,13 +13,13 @@ class EqualityFilter(Filter):
         self.operator = operator
         self.value = value
 
-    def schemas(self, element):
-        element = utils.wrap_list(element)
+    def schemas(self, elements, **kwargs):
+        elements = utils.wrap_list(elements)
         value = utils.wrap_list(self.value)
 
         criterion = None
-        for el, value in zip(element, value):
-            crit = getattr(el, self.operator)(value)
+        for element, value in zip(elements, value):
+            crit = getattr(element, self.operator)(value)
             if criterion:
                 criterion = criterion & crit
             else:
@@ -35,6 +35,15 @@ class ContainsFilter(Filter):
 
     def schemas(self, element):
         return element.isin(self.values)
+
+
+class ExcludesFilter(Filter):
+    def __init__(self, element_key, values):
+        super(ExcludesFilter, self).__init__(element_key)
+        self.values = values
+
+    def schemas(self, element):
+        return element.notin(self.values)
 
 
 class RangeFilter(Filter):

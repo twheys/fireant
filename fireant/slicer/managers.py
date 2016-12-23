@@ -1,10 +1,12 @@
 # coding: utf-8
 
 import functools
-from collections import OrderedDict
 
+from collections import OrderedDict
+from fireant.slicer.operations import Totals
 from fireant import utils
 from pypika import functions as fn
+
 from .postprocessors import OperationManager
 from .queries import QueryManager
 
@@ -51,44 +53,75 @@ class SlicerManager(QueryManager, OperationManager):
         :return:
             A transformed response that is queried based on the slicer and the format.
         """
-        from fireant import settings
-        if settings.database is None:
-            raise SlicerException('Unable to execute queries until a database is configured.  Please import '
-                                  '`fireant.settings` and set some value to `settings.database`.')
-
         metrics = utils.filter_duplicates(metrics)
         dimensions = utils.filter_duplicates(dimensions)
 
-        query_schema = self.query_schema(metrics=metrics, dimensions=dimensions,
-                                         metric_filters=metric_filters, dimension_filters=dimension_filters,
-                                         references=references, operations=operations)
-        dataframe = self.query_data(**query_schema)
-
+        query_schema = self.data_query_schema(metrics=metrics, dimensions=dimensions,
+                                              metric_filters=metric_filters, dimension_filters=dimension_filters,
+                                              references=references, operations=operations)
         operation_schema = self.operation_schema(operations)
+
+        dataframe = self.query_data(**query_schema)
         return self.post_process(dataframe, operation_schema)
 
-    def query_schema(self, metrics=(), dimensions=(),
-                     metric_filters=(), dimension_filters=(),
-                     references=(), operations=()):
-        schema_metrics, metrics_joins = self._metrics_schema(metrics, operations)
-        schema_dimensions, dimensions_joins = self._dimensions_schema(dimensions)
-        schema_joins = self._joins_schema(metrics_joins | dimensions_joins)
+    def dimension_options(self, dimension, filters, limit=None):
+        dimopt_schema = self.dimension_option_schema(dimension, filters, limit)
+        return self.query_dimension_options(**dimopt_schema)
+
+    def data_query_schema(self, metrics=(), dimensions=(),
+                          metric_filters=(), dimension_filters=(),
+                          references=(), operations=()):
+        """
+        Builds a `dict` model of the schema parts required for executing a data query given a request.
+
+        :param metrics:
+        :param dimensions:
+        :param metric_filters:
+        :param dimension_filters:
+        :param references:
+        :param operations:
+
+        :return:
+        """
+
+        metric_joins_schema = self._joins_schema(set(metrics) | {mf.element_key for mf in metric_filters},
+                                                 self.slicer.metrics)
+        dimension_joins_schema = self._joins_schema(set(dimensions) | {df.element_key for df in dimension_filters},
+                                                    self.slicer.dimensions)
+        return {
+            'database': self.slicer.database,
+            'table': self.slicer.table,
+
+            'metrics': self._metrics_schema(metrics, operations),
+            'dimensions': self._dimensions_schema(dimensions),
+
+            'mfilters': self._filters_schema(self.slicer.metrics, metric_filters,
+                                             self._default_metric_definition,
+                                             element_label='metric'),
+            'dfilters': self._filters_schema(self.slicer.dimensions,
+                                             dimension_filters,
+                                             self._default_dimension_definition),
+
+            'joins': list(metric_joins_schema | dimension_joins_schema),
+            'references': self._references_schema(references, dimensions),
+            'rollup': self._totals_schema(dimensions, operations),
+        }
+
+    def dimension_option_schema(self, dimension, filters, limit=None):
+        dimensions = [dimension]
+
+        schema_dimensions = self._dimensions_schema(dimensions)
+        schema_filters = self._filters_schema(self.slicer.dimensions, filters, self._default_dimension_definition)
+        schema_joins = self._joins_schema(set(dimensions) | {df.element_key for df in filters},
+                                          self.slicer.dimensions)
 
         return {
-            'table': self.slicer.table,
+            'database': self.slicer.database,
+            'table': self.slicer.hint_table or self.slicer.table,
             'joins': schema_joins,
-            'metrics': schema_metrics,
             'dimensions': schema_dimensions,
-            'mfilters': self._filters_schema(self.slicer.metrics, metric_filters,
-                                             self._default_metric_definition, element_label='metric'),
-            'dfilters': self._filters_schema(self.slicer.dimensions, dimension_filters,
-                                             self._default_dimension_definition),
-            'references': self._references_schema(references, dimensions, schema_dimensions),
-            'rollup': [level
-                       for operation in operations
-                       if 'totals' == operation.key
-                       for dimension in operation.dimension_keys
-                       for level in self.slicer.dimensions[dimension].levels()],
+            'filters': schema_filters,
+            'limit': limit,
         }
 
     def display_schema(self, metrics=(), dimensions=(), references=(), operations=()):
@@ -113,7 +146,7 @@ class SlicerManager(QueryManager, OperationManager):
         """
         return {
             'metrics': self._display_metrics(metrics, operations),
-            'dimensions': self._display_dimensions(dimensions),
+            'dimensions': self._display_dimensions(dimensions, operations),
             'references': OrderedDict([(reference.key, reference.label)
                                        for reference in references]),
         }
@@ -142,30 +175,22 @@ class SlicerManager(QueryManager, OperationManager):
             raise SlicerException('Invalid metrics included in request: '
                                   '[%s]' % ', '.join(invalid_metrics))
 
-        joins = set()
-        metrics = {}
+        schema_metrics = OrderedDict()
         for key in keys:
             schema_metric = self.slicer.metrics.get(key)
 
-            for key, definition in schema_metric.schemas():
-                metrics[key] = definition or self._default_metric_definition(key)
+            for metric_key, definition in schema_metric.schemas():
+                schema_metrics[metric_key] = definition or self._default_metric_definition(metric_key)
 
-            if schema_metric.joins:
-                joins |= set(schema_metric.joins)
-
-        return metrics, joins
+        return schema_metrics
 
     def _dimensions_schema(self, keys):
-        invalid_dimensions = {key[0]
-                              if isinstance(key, (tuple, list))
-                              else key
-                              for key in keys} - set(self.slicer.dimensions)
+        invalid_dimensions = {utils.slice_first(key) for key in keys} - set(self.slicer.dimensions)
         if invalid_dimensions:
             raise SlicerException('Invalid dimensions included in request: '
                                   '[%s]' % ', '.join(invalid_dimensions))
 
-        joins = set()
-        dimensions = {}
+        dimensions = OrderedDict()
         for dimension in keys:
             # unpack tuples for args
             if isinstance(dimension, (list, tuple)):
@@ -175,34 +200,48 @@ class SlicerManager(QueryManager, OperationManager):
 
             schema_dimension = self.slicer.dimensions.get(dimension)
 
-            for key, definition in schema_dimension.schemas(*args):
+            for key, definition in schema_dimension.schemas(*args, database=self.slicer.database):
                 dimensions[key] = definition or self._default_dimension_definition(key)
 
-            if schema_dimension.joins:
-                joins |= set(schema_dimension.joins)
+        return dimensions
 
-        return dimensions, joins
+    def _joins_schema(self, keys, elements):
+        """
 
-    def _joins_schema(self, keys):
-        return [(self.slicer.joins[key].table, self.slicer.joins[key].criterion, self.slicer.joins[key].join_type)
-                for key in keys]
+        :param keys:
+            The keys of the schema elements to retrieve joins for.
+        :param elements:
+            The elements to retrieve the joins from, either slicer.metrics or slicer.dimensions.
+        :return:
+            A `set` of join schemas containing the join table and the join criterion.
+        """
+        joins = set()
+
+        for key in keys:
+            element = elements.get(utils.slice_first(key))
+            if element and element.joins:
+                joins |= set(element.joins)
+
+        return {(self.slicer.joins[key].table,
+                 self.slicer.joins[key].criterion,
+                 self.slicer.joins[key].join_type) for key in joins}
 
     def _filters_schema(self, elements, filters, default_value_func, element_label='dimension'):
         filters_schema = []
-        for f in filters:
-            if '.' in f.element_key:
-                element_key, modifier = f.element_key.split('.')
+        for filter_item in filters:
+            if isinstance(filter_item.element_key, (tuple, list)):
+                element_key, modifier = filter_item.element_key
             else:
-                element_key, modifier = f.element_key, None
+                element_key, modifier = filter_item.element_key, None
 
             element = elements.get(element_key)
             if not element:
                 raise SlicerException(
                     'Unable to apply filter [{filter}].  '
                     'No such {element} with key [{key}].'.format(
-                        filter=f,
+                        filter=filter_item,
                         element=element_label,
-                        key=f.element_key
+                        key=filter_item.element_key
                     ))
 
             if hasattr(element, 'display_field') and 'display' == modifier:
@@ -211,11 +250,11 @@ class SlicerManager(QueryManager, OperationManager):
             else:
                 definition = element.definition or default_value_func(element.key)
 
-            filters_schema.append(f.schemas(definition))
+            filters_schema.append(filter_item.schemas(definition))
 
         return filters_schema
 
-    def _display_dimensions(self, dimensions):
+    def _display_dimensions(self, dimensions, operations):
         req_dimension_keys = [utils.slice_first(dimension)
                               for dimension in dimensions]
 
@@ -228,16 +267,20 @@ class SlicerManager(QueryManager, OperationManager):
                 display_dim['display_options'] = {opt.key: opt.label
                                                   for opt in dimension.display_options}
 
-            if hasattr(dimension, 'display_field'):
+            total_operations = [operation for operation in operations if isinstance(operation, Totals)]
+            for total_operation in total_operations:
+                if key in total_operation.dimension_keys:
+                    display_dim['display_options'][total_operation.key] = total_operation.label
+
+            if hasattr(dimension, 'display_field') and dimension.display_field:
                 display_dim['display_field'] = '%s_display' % dimension.key
 
             display_dims[key] = display_dim
 
         return display_dims
 
-    def _references_schema(self, references, dimensions, schema_dimensions):
-        dimension_keys = {dimension[0] if isinstance(dimension, (list, tuple, set)) else dimension
-                          for dimension in dimensions}
+    def _references_schema(self, references, dimensions):
+        dimension_keys = {utils.slice_first(dimension) for dimension in dimensions}
 
         schema_references = OrderedDict()
         for reference in references:
@@ -254,7 +297,11 @@ class SlicerManager(QueryManager, OperationManager):
                     'Dimension [{dimension}] must be a DatetimeDimension.'.format(reference=str(reference),
                                                                                   dimension=reference.element_key))
 
-            schema_references[reference.key] = reference.element_key
+            schema_references[reference.key] = {
+                'dimension': reference.element_key,
+                'interval': reference.interval,
+                'modifier': reference.modifier,
+            }
 
         return schema_references
 
@@ -266,25 +313,50 @@ class SlicerManager(QueryManager, OperationManager):
 
     def _display_metrics(self, metrics, operations):
         display = OrderedDict()
-        for metric_key in metrics:
-            schema = self.slicer.metrics[metric_key]
-            display[metric_key] = {attr: getattr(schema, attr)
-                                   for attr in ['label', 'precision', 'prefix', 'suffix']
-                                   if getattr(schema, attr) is not None}
+
+        axis = 0
+        for metrics_level in metrics:
+            for metric_key in utils.wrap_list(metrics_level):
+                schema = self.slicer.metrics[metric_key]
+                display[metric_key] = {attr: getattr(schema, attr)
+                                       for attr in ['label', 'precision', 'prefix', 'suffix']
+                                       if getattr(schema, attr) is not None}
+                display[metric_key]["axis"] = axis
+            axis += 1
 
         for operation in operations:
-            metric_key = getattr(operation, 'metric_key')
-            if metric_key is None:
+            if not hasattr(operation, 'metric_key'):
                 continue
 
-            key = '{}_{}'.format(metric_key, operation.key)
+            metric_key = operation.metric_key
             metric_schema = self.slicer.metrics[metric_key]
+
+            key = '{}_{}'.format(metric_key, operation.key)
             display[key] = {attr: getattr(metric_schema, attr)
                             for attr in ['precision', 'prefix', 'suffix']
                             if getattr(metric_schema, attr) is not None}
             display[key]['label'] = '{} {}'.format(metric_schema.label, operation.label)
+            display[key]["axis"] = axis
+            axis += 1
 
         return display
+
+    def _totals_schema(self, dimensions, operations):
+        dimension_set = set(utils.slice_first(dimension) for dimension in dimensions)
+        totals, missing_dimensions = [], set()
+        for operation in operations:
+            if operation.key != Totals.key:
+                continue
+
+            missing_dimensions |= set(operation.dimension_keys) - dimension_set
+            totals += [level
+                       for dimension in operation.dimension_keys
+                       for level in self.slicer.dimensions[dimension].levels()]
+
+        if missing_dimensions:
+            raise SlicerException("Missing dimensions with keys: {}".format(", ".join(missing_dimensions)))
+
+        return totals
 
 
 class TransformerManager(object):
@@ -340,12 +412,9 @@ class TransformerManager(object):
                                references=references, operations=operations)
 
         # Loads data and transforms it with a given transformer.
-        df = self.manager.data(metrics=metrics, dimensions=dimensions,
-                               metric_filters=metric_filters, dimension_filters=dimension_filters,
-                               references=references, operations=operations)
-
+        dataframe = self.manager.data(metrics=utils.flatten(metrics), dimensions=dimensions,
+                                      metric_filters=metric_filters, dimension_filters=dimension_filters,
+                                      references=references, operations=operations)
         display_schema = self.manager.display_schema(metrics, dimensions, references, operations)
 
-        df = utils.correct_dimension_level_order(df, display_schema)
-
-        return tx.transform(df, display_schema)
+        return tx.transform(dataframe, display_schema)
